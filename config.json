@@ -1,0 +1,29 @@
+{
+  "feed": "auto",
+  "symbols": ["BTC/USDT", "ETH/USDT"],
+  "timeframes": ["1h", "4h"],
+  "candles": 300,
+  "only_closed_candles": true,
+  "detector": {
+    "swing_left": 2,
+    "swing_right": 2,
+    "sweep_window": 3,
+    "min_displacement_atr": 1.5,
+    "min_body_ratio": 0.55,
+    "require_structure_break": true,
+    "atr_period": 14,
+    "entry_retracement_pct": 0.5,
+    "entry_max_wait_bars": 60
+  },
+  "breakout": {
+    "enabled": true,
+    "range_window": 20
+  },
+  "alerts": {
+    "console": true,
+    "sound": false,
+    "log_file": "alerts.jsonl",
+    "telegram_token": "",
+    "telegram_chat_id": ""
+  }
+}
