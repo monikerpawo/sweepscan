@@ -78,7 +78,13 @@ class Signal:
             f"  FVG zone    : {self.fvg_bottom:.6g} - {self.fvg_top:.6g}",
             f"  FVG 50%     : {self.fvg_midpoint:.6g}",
         ]
-        if self.pattern == "reversal" and self.entry_level is not None:
+        if self.pattern == "breakout":
+            # the recent range's opposite boundary the displacement candle
+            # broke through (a "ceiling" for bullish, a "floor" for bearish)
+            # - this was already computed but never shown in the message.
+            label = "ceiling" if self.direction == "bullish" else "floor"
+            lines.append(f"  {label:<12}: {self.broke_structure_at:.6g}")
+        if self.entry_level is not None:
             lines.append(f"  watching for: entry near {self.entry_level:.6g} "
                           f"({self.entry_pct*100:.0f}% back toward {self.broke_structure_at:.6g})")
         lines.append(f"  last close  : {self.close:.6g}")
@@ -90,15 +96,19 @@ def entry_summary(p: dict) -> str:
     watched retracement level and the entry is live."""
     label, score = confidence_score(p)
     pct = p.get("entry_pct") or 0.5
+    is_breakout = p.get("pattern") == "breakout"
+    tag = "BREAKOUT ENTRY" if is_breakout else "ENTRY"
     lines = [
-        f"{p['symbol']} {p['timeframe']} | {p['direction'].upper()} ENTRY "
+        f"{p['symbol']} {p['timeframe']} | {p['direction'].upper()} {tag} "
         f"({pct*100:.0f}% retest)",
         f"  confidence     : {label} ({score}/100)",
         f"  entry level    : {p['entry_level']:.6g}",
         f"  swept level    : {p['swept_level']:.6g}",
     ]
     if p.get("broke_structure_at") is not None:
-        lines.append(f"  broke structure: {p['broke_structure_at']:.6g}")
+        struct_label = ("ceiling" if p.get("direction") == "bullish" else "floor") \
+            if is_breakout else "broke structure"
+        lines.append(f"  {struct_label:<15}: {p['broke_structure_at']:.6g}")
     lines += [
         f"  FVG zone       : {p['fvg_bottom']:.6g} - {p['fvg_top']:.6g}",
         f"  displacement   : {p['displacement_atr_mult']:.1f}x ATR",
@@ -200,6 +210,22 @@ def find_bullish_fvg(candles, i):
     return (bottom, top) if top > bottom else None
 
 
+def _fvg_near_level(level, fvg_bottom, fvg_top, atr_value, mult):
+    """Is `level` (a swing high/low) inside the FVG, or at least close to it?
+    Used to invalidate a breakout setup whose FVG formed nowhere near the
+    level price is actually going to retrace back to - a technically-valid
+    sweep+displacement+FVG combo where the FVG and the broken structure
+    aren't part of the same move isn't the pattern this is meant to catch.
+    Distance is measured in units of the signal's own ATR so the tolerance
+    scales sensibly across symbols with very different price levels."""
+    if fvg_bottom <= level <= fvg_top:
+        return True
+    if atr_value <= 0:
+        return False
+    dist = min(abs(level - fvg_bottom), abs(level - fvg_top))
+    return dist <= mult * atr_value
+
+
 def detect(candles, symbol="", timeframe="", lookback=60, swing_left=2,
            swing_right=2, sweep_window=3, min_displacement_atr=1.5,
            min_body_ratio=0.55, require_structure_break=True, atr_period=14,
@@ -229,21 +255,33 @@ def detect(candles, symbol="", timeframe="", lookback=60, swing_left=2,
             continue
 
         if c["close"] < c["open"]:   # bearish
-            swept, sidx = None, None
+            # swept = the swing HIGH whose buyside liquidity got taken (the
+            # "swing low -> swing high" leg's top). high_idx is WHICH swing
+            # high that was, so the structure-break check below is tied to
+            # THIS SAME leg's swing low - not just any low anywhere in the
+            # lookback window. Without that link, the sweep and the "break"
+            # can be two unrelated pivots from different parts of the chart
+            # (e.g. a noisy 5m forex chart), which technically passes both
+            # checks but isn't the single low->high->back-below-the-low
+            # zigzag the model actually describes.
+            swept, sidx, high_idx = None, None, None
             for j in range(max(0, i - sweep_window), i + 1):
                 for h in [x for x in highs if x < j]:
                     lvl = candles[h]["high"]
                     if candles[j]["high"] > lvl and c["close"] < lvl:
                         if swept is None or lvl > swept:
-                            swept, sidx = lvl, j
+                            swept, sidx, high_idx = lvl, j, h
             if swept is None:
                 continue
             broke = None
             if require_structure_break:
-                for l in reversed([x for x in lows if x < i]):
-                    if c["close"] < candles[l]["low"]:
-                        broke = candles[l]["low"]
-                        break
+                prior_lows = [x for x in lows if x < high_idx]
+                if prior_lows:
+                    low_idx = prior_lows[-1]  # the swing low that formed right
+                                               # before this specific swept high
+                    lvl = candles[low_idx]["low"]
+                    if c["close"] < lvl and lvl < swept:
+                        broke = lvl
                 if broke is None:
                     continue
             fvg = find_bearish_fvg(candles, i)
@@ -256,22 +294,27 @@ def detect(candles, symbol="", timeframe="", lookback=60, swing_left=2,
                                       (t + b) / 2, t - b, candles[-1]["close"],
                                       atr_value=a, pattern="reversal", extreme=extreme,
                                       entry_level=entry_level, entry_pct=entry_retracement_pct))
-        else:                        # bullish
-            swept, sidx = None, None
+        else:                        # bullish (mirror of the bearish case above -
+            # swept = the swing LOW whose sellside liquidity got taken; the
+            # structure break must be back above the SAME leg's swing high)
+            swept, sidx, low_idx = None, None, None
             for j in range(max(0, i - sweep_window), i + 1):
                 for l in [x for x in lows if x < j]:
                     lvl = candles[l]["low"]
                     if candles[j]["low"] < lvl and c["close"] > lvl:
                         if swept is None or lvl < swept:
-                            swept, sidx = lvl, j
+                            swept, sidx, low_idx = lvl, j, l
             if swept is None:
                 continue
             broke = None
             if require_structure_break:
-                for h in reversed([x for x in highs if x < i]):
-                    if c["close"] > candles[h]["high"]:
-                        broke = candles[h]["high"]
-                        break
+                prior_highs = [x for x in highs if x < low_idx]
+                if prior_highs:
+                    high_idx = prior_highs[-1]  # the swing high that formed
+                                                 # right before this swept low
+                    lvl = candles[high_idx]["high"]
+                    if c["close"] > lvl and lvl > swept:
+                        broke = lvl
                 if broke is None:
                     continue
             fvg = find_bullish_fvg(candles, i)
@@ -289,11 +332,24 @@ def detect(candles, symbol="", timeframe="", lookback=60, swing_left=2,
 
 def detect_breakout(candles, symbol="", timeframe="", lookback=60, swing_left=2,
                      swing_right=2, sweep_window=3, min_displacement_atr=1.5,
-                     min_body_ratio=0.55, atr_period=14, range_window=20):
+                     min_body_ratio=0.55, atr_period=14, range_window=20,
+                     entry_retracement_pct=0.5, fvg_near_structure_atr=2.0):
     """Second pattern: sweep the floor/ceiling of a recent range, then an
     aggressive candle CONTINUES out of the range (no reversal / no opposite
     structure break required) - the stop-hunt-then-breakout setup, as
-    opposed to detect()'s sweep-then-reversal setup."""
+    opposed to detect()'s sweep-then-reversal setup.
+
+    Same two-stage retest behavior as detect()'s reversal setups: this
+    doesn't fire the moment the breakout happens, it computes an
+    entry_level - the same halfway-back-to-the-broken-level math used for
+    reversals - and the caller (scan_once) arms it and waits for price to
+    actually retrace there before alerting.
+
+    A setup is only valid if the FVG the displacement candle left behind
+    actually sits near the level being broken (see _fvg_near_level) - a
+    breakout whose FVG formed somewhere unrelated to the level price will
+    eventually retest isn't the same setup, even if the raw sweep+
+    displacement+FVG checks all technically pass."""
     signals = []
     n = len(candles)
     if n < atr_period + swing_left + swing_right + 3:
@@ -340,12 +396,15 @@ def detect_breakout(candles, symbol="", timeframe="", lookback=60, swing_left=2,
             fvg = find_bullish_fvg(candles, i)
             if fvg:
                 b, t = fvg
+                if not _fvg_near_level(ceiling, b, t, a, fvg_near_structure_atr):
+                    continue
                 extreme = max(x["high"] for x in candles[sidx:i + 1])
+                entry_level = extreme + entry_retracement_pct * (ceiling - extreme)
                 signals.append(Signal(symbol, timeframe, "bullish", c["time"],
                                       swept, sidx, i, mult, ceiling, t, b,
                                       (t + b) / 2, t - b, candles[-1]["close"],
                                       atr_value=a, pattern="breakout", extreme=extreme,
-                                      entry_level=None))
+                                      entry_level=entry_level, entry_pct=entry_retracement_pct))
         else:                         # bearish: sweep the range ceiling, break the range floor
             swept, sidx = None, None
             for j in range(max(recent, i - sweep_window), i + 1):
@@ -366,12 +425,15 @@ def detect_breakout(candles, symbol="", timeframe="", lookback=60, swing_left=2,
             fvg = find_bearish_fvg(candles, i)
             if fvg:
                 b, t = fvg
+                if not _fvg_near_level(floor, b, t, a, fvg_near_structure_atr):
+                    continue
                 extreme = min(x["low"] for x in candles[sidx:i + 1])
+                entry_level = extreme + entry_retracement_pct * (floor - extreme)
                 signals.append(Signal(symbol, timeframe, "bearish", c["time"],
                                       swept, sidx, i, mult, floor, t, b,
                                       (t + b) / 2, t - b, candles[-1]["close"],
                                       atr_value=a, pattern="breakout", extreme=extreme,
-                                      entry_level=None))
+                                      entry_level=entry_level, entry_pct=entry_retracement_pct))
     return signals
 
 
@@ -449,7 +511,12 @@ class PublicFeed:
             if base in ("XAG", "SILVER"):
                 return "SI=F"
             fx = {"EUR", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF"}
-            if base in fx and q in fx | {"USD"}:
+            # Yahoo's FX tickers are directional (EURUSD=X, but also
+            # USDJPY=X - USD as the BASE for JPY/CAD/CHF, since those are
+            # conventionally quoted the other way round from EUR/GBP/AUD/NZD).
+            # Originally this only handled base-in-fx and missed USD/JPY,
+            # USD/CAD, USD/CHF style pairs entirely.
+            if (base in fx and (q in fx or q == "USD")) or (base == "USD" and q in fx):
                 return f"{base}{q}=X"
             return f"{base}-{q}"
         if ex == "cryptocompare":
@@ -867,7 +934,7 @@ DEFAULTS = {
                   "min_body_ratio": 0.55, "require_structure_break": True,
                   "atr_period": 14, "entry_retracement_pct": 0.5,
                   "entry_max_wait_bars": 60},
-    "breakout": {"enabled": True, "range_window": 20},
+    "breakout": {"enabled": True, "range_window": 20, "fvg_near_structure_atr": 2.0},
     "alerts": {"console": True, "sound": True, "log_file": "alerts.jsonl",
                 "telegram_token": "", "telegram_chat_id": ""},
 }
@@ -960,8 +1027,14 @@ def scan_once(feed, cfg, notifier, seen, armed=None, backtest=False, prime=False
     fires. Setups that never retrace within entry_max_wait_bars are dropped.
 
     Breakout setups (detect_breakout()) are a different pattern - a sweep
-    that continues instead of reversing - and are alerted immediately, same
-    as stage 1 used to be, since there's no retracement to wait for.
+    that continues instead of reversing - but go through the exact same
+    arm-then-wait-for-retest flow as reversal setups: detect_breakout()
+    computes an entry_level (halfway back from the move's extreme toward
+    the broken ceiling/floor, same math as reversal) and only rejects a
+    setup outright if its FVG isn't near that ceiling/floor level
+    (see _fvg_near_level). Everything that survives gets parked in `armed`
+    right alongside reversal setups and only alerts once price actually
+    retests entry_level.
 
     prime=True seeds `seen` from whatever is already sitting in the fetched
     history and still fully arms + resolves setups against that history (so
@@ -986,6 +1059,8 @@ def scan_once(feed, cfg, notifier, seen, armed=None, backtest=False, prime=False
     breakout_enabled = bcfg.pop("enabled", True)
     b_kwargs = {k: v for k, v in d.items() if k != "require_structure_break"}
     b_kwargs["range_window"] = bcfg.get("range_window", 20)
+    b_kwargs["entry_retracement_pct"] = entry_pct
+    b_kwargs["fvg_near_structure_atr"] = bcfg.get("fvg_near_structure_atr", 2.0)
 
     for symbol in cfg["symbols"]:
         for tf in cfg["timeframes"]:
@@ -1023,12 +1098,13 @@ def scan_once(feed, cfg, notifier, seen, armed=None, backtest=False, prime=False
                     continue
                 armed[key] = {"signal": s.as_dict(), "direction": s.direction,
                                "symbol": symbol, "tf": tf, "entry_level": s.entry_level,
-                               "disp_time": _epoch(s.time), "age": 0, "fired": False}
+                               "disp_time": _epoch(s.time), "age": 0, "fired": False,
+                               "pattern": "reversal"}
                 if not prime:
                     log(f"  {symbol} {tf}: {s.direction.upper()} setup formed - watching for "
                         f"entry near {s.entry_level:.6g} ({s.entry_pct*100:.0f}% retest)")
 
-            # --- breakout pattern: alerted immediately, no retest wait ---
+            # --- breakout pattern: arm it too, same retest-wait flow as reversal ---
             if breakout_enabled:
                 try:
                     bsigs = detect_breakout(candles, symbol=symbol, timeframe=tf, **b_kwargs)
@@ -1041,21 +1117,18 @@ def scan_once(feed, cfg, notifier, seen, armed=None, backtest=False, prime=False
                         continue
                     seen.add(key)
                     new += 1
-                    if prime:
+                    if s.entry_level is None:
                         continue
-                    hits += 1
-                    p = s.as_dict()
-                    p["stage"] = "breakout"
-                    lo = max(0, s.sweep_index - 12)
-                    hi = min(len(candles), s.displacement_index + 10)
-                    chart = {"candles": [{"time": c["time"], "open": c["open"],
-                                          "high": c["high"], "low": c["low"],
-                                          "close": c["close"]} for c in candles[lo:hi]],
-                              "sweep_pos": s.sweep_index - lo, "disp_pos": s.displacement_index - lo}
-                    notifier.send(f"{s.direction.upper()} BREAKOUT | {symbol} {tf}",
-                                  s.summary(), p, chart)
+                    armed[key] = {"signal": s.as_dict(), "direction": s.direction,
+                                   "symbol": symbol, "tf": tf, "entry_level": s.entry_level,
+                                   "disp_time": _epoch(s.time), "age": 0, "fired": False,
+                                   "pattern": "breakout"}
+                    if not prime:
+                        log(f"  {symbol} {tf}: {s.direction.upper()} BREAKOUT setup formed - "
+                            f"watching for entry near {s.entry_level:.6g} "
+                            f"({s.entry_pct*100:.0f}% retest)")
 
-            # --- stage 2: check armed reversal setups for this symbol/tf against the retest ---
+            # --- stage 2: check armed setups (reversal + breakout) for this symbol/tf ---
             # (always runs, even during prime - a setup that already retraced somewhere back in
             # the fetched history needs to be resolved now, silently, or it'll wrongly look "new"
             # and fire a stale alert the next time this symbol/tf is scanned)
@@ -1078,8 +1151,9 @@ def scan_once(feed, cfg, notifier, seen, armed=None, backtest=False, prime=False
                     if prime:
                         continue
                     hits += 1
+                    is_breakout = rec.get("pattern") == "breakout"
                     p = dict(rec["signal"])
-                    p["stage"] = "entry"
+                    p["stage"] = "breakout_entry" if is_breakout else "entry"
                     p["close"] = hit["close"]
                     idx = candles.index(hit)
                     lo, hi = max(0, idx - 15), min(len(candles), idx + 3)
@@ -1087,7 +1161,8 @@ def scan_once(feed, cfg, notifier, seen, armed=None, backtest=False, prime=False
                                           "high": c["high"], "low": c["low"],
                                           "close": c["close"]} for c in candles[lo:hi]],
                               "sweep_pos": None, "disp_pos": None, "entry_pos": idx - lo}
-                    notifier.send(f"{rec['direction'].upper()} ENTRY ({p['entry_pct']*100:.0f}% "
+                    tag = "BREAKOUT ENTRY" if is_breakout else "ENTRY"
+                    notifier.send(f"{rec['direction'].upper()} {tag} ({p['entry_pct']*100:.0f}% "
                                   f"retest) | {symbol} {tf}", entry_summary(p), p, chart)
                 elif rec["age"] > max_wait:
                     if not prime:
@@ -1678,7 +1753,7 @@ def run_gui():
                 label, score = confidence_score(p)
                 conf_text = f"{CONF_DOTS[label]} {label}"
                 stage = p.get("stage")
-                tag = {"entry": "ENTRY", "breakout": "BREAKOUT"}.get(stage, "")
+                tag = {"entry": "ENTRY", "breakout_entry": "BREAKOUT ENTRY"}.get(stage, "")
                 dir_text = f"{p['direction'].upper()} {tag}".strip()
                 item = self.tree.insert("", 0, values=(
                     t, p["symbol"], p["timeframe"], dir_text,
@@ -1704,7 +1779,7 @@ def run_gui():
             t = t.strftime("%Y-%m-%d %H:%M") if hasattr(t, "strftime") else str(t)
             stage = p.get("stage")
             pattern = p.get("pattern", "reversal")
-            kind = {"entry": " · ENTRY", "breakout": " · BREAKOUT"}.get(stage, "")
+            kind = {"entry": " · ENTRY", "breakout_entry": " · BREAKOUT ENTRY"}.get(stage, "")
             lines = [
                 f"{p['symbol']}  ·  {p['timeframe']}  ·  {p['direction'].upper()}{kind}",
                 f"Confidence   : {CONF_DOTS[label]} {label}  ({score}/100)",
@@ -1720,13 +1795,12 @@ def run_gui():
                 f"FVG zone     : {p['fvg_bottom']:.6g} - {p['fvg_top']:.6g}",
                 f"FVG 50%      : {p['fvg_midpoint']:.6g}",
             ]
-            if pattern == "reversal":
-                if stage == "entry":
-                    lines.append(f"Entry level  : {p.get('entry_level'):.6g} "
-                                 f"({(p.get('entry_pct') or 0.5)*100:.0f}% retest - triggered)")
-                elif p.get("entry_level") is not None:
-                    lines.append(f"Watching for : {p['entry_level']:.6g} "
-                                 f"({(p.get('entry_pct') or 0.5)*100:.0f}% retest)")
+            if stage in ("entry", "breakout_entry"):
+                lines.append(f"Entry level  : {p.get('entry_level'):.6g} "
+                             f"({(p.get('entry_pct') or 0.5)*100:.0f}% retest - triggered)")
+            elif p.get("entry_level") is not None:
+                lines.append(f"Watching for : {p['entry_level']:.6g} "
+                             f"({(p.get('entry_pct') or 0.5)*100:.0f}% retest)")
             lines.append(f"Last close   : {p['close']:.6g}")
             self.detail_var.set("\n".join(lines))
             draw_candle_chart(self.chart_canvas, p, chart, 440, 230)
