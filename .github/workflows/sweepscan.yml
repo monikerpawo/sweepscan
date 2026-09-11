@@ -6,7 +6,7 @@ on:
     # best-effort and can lag a few minutes during busy periods - that's
     # normal and fine for this use case. Edit the cron expression below to
     # change how often it scans (all times are UTC).
-    - cron: "*/15 * * * *"
+    - cron: "*/5 * * * *"
   # Lets you trigger a run by hand from the Actions tab (Run workflow button)
   # any time you want to test it without waiting for the schedule.
   workflow_dispatch: {}
